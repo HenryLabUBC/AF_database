@@ -1,0 +1,3 @@
+script failed with no files left to process
+script failed with no files left to process
+Binary file ./duplicateCSV/AF_database/Entered_data/Environmental_Data/Climate/Raw_climate_data/1997_climate_data/Cassiope/CASS_1997_2.dat matches
