@@ -82,7 +82,6 @@ Colate_snow_depth <- function(){
     # The value will be TRUE if that column's data is consistent with snow depth.
     is_snow <- snow_depth_identifier(dataframe, is_identefier)
     if (length(is_snow) == 0 || sum(is_snow) == 0){
-      no_snow_list(file_path, output_dir)
       file_path <- next_file(output_dir)
       next
     }
@@ -103,7 +102,7 @@ Colate_snow_depth <- function(){
                                                 is_site,
                                                 file_path)
     # Create a new file in the output directory containing the snow_depth_dataframe
-    save_snow_depth(snow_depth_dataframe, output_dir, is_year, is_identefier)
+    save_snow_depth(snow_depth_dataframe, output_dir, is_year)
     
     # Remove the top file from files.txt and set file_path to the next file to reset the loop.
     file_path <- next_file(output_dir)
@@ -373,6 +372,11 @@ snow_depth_identifier <- function(dataframe, is_identifier){
   is_snow
 }
 
+# A function which analyses every column in dataframe and returns a logical vector where
+# the value true indicates the corresponding column contains a list of years.
+# A column is identified as containing year data if, ignoring all 6999 values, NAs,
+# non-numeric data, and the 1st and last quartiles, the data ranges from 1980-2030
+# and there are at least 10 data points for every unique value identified.
 year_identifier <- function(dataframe){
   is_year <- vector("logical")
   for (i in 1:length(dataframe)){
@@ -381,10 +385,13 @@ year_identifier <- function(dataframe){
     col <- as.numeric(col)
     col <- col[!is.na(col)]
     if (length(col) > 0){
+      # squeezed range is the range missing the first and last quartiles
       squeezed_range <- unname(quantile(col))[c(2,4)]
+      # unique ratio is a measure of how little the variable changes. There should be
+      # many results per year, so a low unique ratio is expected.
       unique_ratio <- length(unique(col))/length(col)
       if (squeezed_range[1] > 1980 &&
-          squeezed_range[2] < 2030 &&
+          squeezed_range[2] < 2030 && # 2030 was chosen to future proof the script
           unique_ratio < 0.1 ||
           squeezed_range[1] > 1980 &&
           squeezed_range[2] < 2030 &&
@@ -395,6 +402,10 @@ year_identifier <- function(dataframe){
   is_year
 }
 
+# A function which accepts a dataframe, and the logical vectors is_day, is_year,
+# is_identifier, is_snow, and is_site, and uses these logical vectors to produce
+# a new dataframe containing only Identifier, Year, Day, Snow_depth, and site data.
+# Finally, it creates a new column, file, detailing the file path to the original data.
 construct_snow_data <- function(dataframe, is_day, is_year, is_identifier,
                                 is_snow, is_site, file_path){
   
@@ -403,15 +414,22 @@ construct_snow_data <- function(dataframe, is_day, is_year, is_identifier,
                                                colnames(dataframe)[is_day],
                                                colnames(dataframe)[is_snow],
                                                colnames(dataframe)[is_site]) %>%
+    # Remove all rows not pertaining to snow depth
     filter(grepl('(^|,) *"?239"? *(,|$)', dataframe[is_identifier][[1]])) %>%
+    # Create new column, file, detailing where the original data was found
     mutate(file = file_path)
   
   snow_depth_dataframe
 }
 
-save_snow_depth <- function (snow_depth_dataframe, output_dir, is_year, is_identifier){
-  if (length(is_year) > 0 && sum(is_year) > 0){
-  years <- snow_depth_dataframe[[2]]
+# A function which takes the snow depth dataframe produced by construct_snow_data
+# and writes it to file. It names the file as cassiope_snow_depth_YEAR-YEAR.csv, if
+# the file spans multiple years, or cassiope_snow_depth_YEAR_DAY-DAY.csv if it doesn't
+# If a file with the same name already exists, an iterator is added to the end. Files
+# are written to the output directory
+save_snow_depth <- function (snow_depth_dataframe, output_dir, is_year){
+  if (length(is_year) > 0 && sum(is_year) > 0){ #If a year column has been identified
+  years <- snow_depth_dataframe[[2]] # Year will be the second column
   years <- as.numeric(years)
   years <- years[!is.na(years)]
   first_year <- years[1]
@@ -420,10 +438,13 @@ save_snow_depth <- function (snow_depth_dataframe, output_dir, is_year, is_ident
     first_year <- "unknown_year"
     last_year <- "unknown_year"
   }
+  # If the file spans more than one year name file: cassiope_snow_depth_YEAR1-YEAR2.csv
   if (first_year != last_year){
   file_name <- paste0(output_dir, "/cassiope_snow_depth_",as.character(first_year),
                       "-", as.character(last_year), ".csv")
   } else {
+    # If the data is all from one year, determine the first and last day and name file
+    # cassiope_snow_depth_YEAR_day_DAY1-DAY2.csv
     days <- snow_depth_dataframe[[2 + sum(is_year)]]
     days <- as.numeric(days)
     days <- days[!is.na(days)]
@@ -432,6 +453,8 @@ save_snow_depth <- function (snow_depth_dataframe, output_dir, is_year, is_ident
     file_name <- paste0(output_dir, "/cassiope_snow_depth_",as.character(first_year),
                         "_day_", as.character(first_day), "-", as.character(last_day), ".csv")
   }
+  # If file name already exists in directory, iterate with count such that file is
+  # now named file_name_count.csv
   count <- 1
   original_file_name <- file_name
   while (file.exists(file_name)){
@@ -441,6 +464,9 @@ save_snow_depth <- function (snow_depth_dataframe, output_dir, is_year, is_ident
   write_csv(snow_depth_dataframe, file_name)
 }
 
+# Site identifier would find a column containing site names for cassiope, but no such
+# data has been recorded. It would return a logical vector with a value for every 
+# column in dataframe.
 site_identifier <- function(dataframe){
   is_site <- vector("logical")
   for (i in 1:length(dataframe)){
@@ -452,13 +478,16 @@ site_identifier <- function(dataframe){
   }
   is_site
 }
-no_snow_list <- function(file_path, output_dir){
-  write_lines(file_path, paste0(output_dir, "/no_snow_columns.txt"), append = TRUE)
-}
-
+# A function to read the next line from the text document files.txt (which contains
+# all the file paths for files that were found to contain the target searched for).
+# The function also removes the previous file path from files.txt, which has now been
+# processed. It returns the file path to process next
 next_file <- function(output_dir){
+  # Read all of files.txt minus the first line into variable files
   files <- read_lines(paste0(output_dir, "/files.txt"), skip = 1)
+  # Overwrite files.txt with this updated file list
   write_lines(files, paste0(output_dir, "files.txt"), sep = "\n")
+  # Set file path to the top file of the new list
   file_path <- files[1]
   file_path
 }
