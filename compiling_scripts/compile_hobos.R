@@ -2,10 +2,10 @@ library(data.table)
 library(stringr)
 library(lubridate)
 
-output_dir <- "<directory for output graphs and CSVs>"
-input_dir <- "<directory for source lump files>"
+output_dir <- "/home/ross/Desktop/compiled_hobo/"
+input_dir <- "/media/ross/BackupPlus/Hoba_data/"
 
-compile_hobo_data <- function(output_dir, input_dir, site, data_selection){
+compile_hobo_data <- function(output_dir, input_dir, site){
     # create named list of all site specific extractor functions. The appropriate function will
     # be selected by the site_setup function
     site_extractor_functions <- list(
@@ -35,7 +35,7 @@ compile_hobo_data <- function(output_dir, input_dir, site, data_selection){
                                      "file_name",
                                      "number",
                                      "Date_Time",
-                                     "Temp"
+                                     "all_data"
     ))
     
     # Remove a needless counting number that was somehow appended to the file names
@@ -46,6 +46,9 @@ compile_hobo_data <- function(output_dir, input_dir, site, data_selection){
     # in columns "Plot" and "data_type"
     extract_plot_and_type(site_data)
     
+    # Convert all numeric data to numeric from character data
+    site_data[, all_data := as.numeric(all_data)]
+    
     # Combine the file_name with the year to produce a unique identifier for each file (some file_names
     # were used multiple times across years)
     site_data[, file_with_year := paste0(file_name, "_", Year)]
@@ -54,7 +57,7 @@ compile_hobo_data <- function(output_dir, input_dir, site, data_selection){
     site_data <- site_data[is.na(number) | number != "#"]
     
     # filter out all data not relevant to the desired sensor type
-    site_data <- data_type_selector(site_data, data_selection)
+    site_data <- data_type_selector(site_data)
     
     # The formatting of the dates in the lump (and original) data has been selectively
     # mangled by Excel performing undesirable auto-formatting. The fix_date function
@@ -102,46 +105,63 @@ compile_hobo_data <- function(output_dir, input_dir, site, data_selection){
     ]
     
     # The data is in a mixture of Celsius and Fahrenheit. Convert all Fahrenheit to Celsius 
-    if (grepl("soil|air", data_selection, ignore.case = TRUE)){
-        
-        convert_to_celsius(site_data)
-    }
+    convert_to_celsius(site_data)
+    
     # If multiple entries have somehow been recorded for the same plot and time then they are averaged if the
     # Standard deviation is less than one. Otherwise, or if the values are outwith -60 - 35 oC, then they are
     # replaced with NA
-    clean_data(site_data)
-    
-    # create output_dir if doesn't already exist
-    if (!dir.exists(output_dir)){
-        dir.create(output_dir, recursive = TRUE)
+    site_data <- clean_data(site_data)
+    # Get list of data columns
+    data_cols <- grep("data", names(site_data), value = TRUE)
+    # For every data column create a csv file containing that data and plot information, and also produce plots
+    # for each file_year
+    for (data_col in data_cols){
+        # create output_dir if doesn't already exist
+        if (!dir.exists(paste0(output_dir, "/", data_col))){
+            dir.create(paste0(output_dir, "/", data_col), recursive = TRUE)
+        }
+        # create a column in site_data detailing which file_years are associated with non-NA data in data_col
+        site_data[, contains_col_data := sum(is.na(.SD)) < nrow(.SD), by=file_with_year, .SDcol = data_col]
+        
+        # Create a new datatable containing only the data relevant to data_col
+        specific_data.table <- copy(site_data[contains_col_data == TRUE & is.na(test),
+                                              .(plot, fixed_date, get(data_col), file_name, file_with_year)])
+        
+        # For some reason the name of the data_col is lost and refuses to be re-appointed using dt[, (data_col) := V3]
+        names(specific_data.table)[3] <- data_col
+        # A plot is made for every plot in every year data is available and written to the output directory
+        make_plots(paste0(output_dir, "/", data_col), specific_data.table)
+        
+        # Write compiled data to file
+        year_range <- paste0(specific_data.table[,min(year(fixed_date))],
+                             "-",
+                             specific_data.table[, max(year(fixed_date))]
+        )
+        data_col_name <- sub("_data", "", data_col)
+        specific_data.table[, c("site", "date", "file_with_year") := .(get("site_name"),
+                                                                       fixed_date,
+                                                                       NULL
+        )]
+        # re-order the columns
+        specific_data.table <- specific_data.table[, .(site, date, plot, get(data_col), file_name)]
+        names(specific_data.table)[4] <- data_col_name
+        
+        setDF(specific_data.table)
+        specific_data.table <- tundra::standardise_plots(specific_data.table, output_dir, data_col)
+        
+        write.csv(specific_data.table, paste0(output_dir,
+                                              "/",
+                                              data_col,
+                                              "/compiled_hobo_",
+                                              site,
+                                              "_",
+                                              data_col_name,
+                                              "_",
+                                              year_range,
+                                              ".csv"
+        )
+        )
     }
-    # A plot is made for every plot in every year data is available and written to the output directory
-    # make_plots(output_dir, site_data, data_selection)
-    
-    # Write compiled data to file
-    year_range <- paste0(site_data[,min(year(fixed_date))],
-                         "-",
-                         site_data[, max(year(fixed_date))]
-    )
-    data_col_name <- site_data[1, data_type]
-    site_data[, c("site", "date", (data_col_name)) := .(get("site_name"),
-                                                        fixed_date,
-                                                        Temp
-    )]
-    selected_cols <- c("site", "plot", "date", data_col_name, "file_name")
-    site_data <- site_data[, ..selected_cols]
-    browser()
-    write.csv(site_data, paste0(output_dir,
-                                "/compiled_hobo_",
-                                site,
-                                "_",
-                                data_col_name,
-                                "_",
-                                year_range,
-                                ".csv"
-    )
-    )
-    
     
     site_data
 }
@@ -160,14 +180,16 @@ extract_plot_and_type_Cas <- function(datatable){
         , plot := sub("-", "", plot)
     ][ # Change the order of the plot name to Letter-Number if not already
         , plot := sub("(\\d+)(\\w+)", "\\2\\1", plot)
-    ][ # Remove all 0s and "b"s from the plot names
-        , plot := sub("0|b", "", plot)
+    ][ # Remove all "b"s from the plot names
+        , plot := sub("b", "", plot)
+    ][ # Remove all starting 0's from plot names eg T03 becomes T3
+        , plot := sub("(\\w)0(\\d)", "\\1\\2", plot)
     ][ # Convert all letters to upper case
         , plot := toupper(plot)
     ][ # Extract the words "soil", "lux", or "_F_" from file names and store in column data_type
         , data_type := str_extract(file_name, "([Ss]oil|[Ll]ux)")
-    ][ # Extract the word "test" from file names and store in column test_data
-        , test_data := str_extract(file_name, "[Tt]est")
+    ][ # Extract the word "test" from file names and store in column test
+        , test := str_extract(file_name, "[Tt]est")
     ]
     datatable
 }
@@ -221,8 +243,8 @@ extract_plot_and_type_Dry <- function(datatable){
         
     ][ # Extract the words "soil", "lux", from file names and store in column data_type
         , data_type := str_extract(file_name, "([Ss]oil|[Ll]ux)")
-    ][ # Extract the word "test" from file names and store in column test_data
-        , test_data := str_extract(file_name, "[Tt]est")
+    ][ # Extract the word "test" from file names and store in column test
+        , test := str_extract(file_name, "[Tt]est")
     ]
     datatable
 }
@@ -272,8 +294,8 @@ extract_plot_and_type_Wil <- function(datatable){
         
     ][ # Extract the words "soil", "lux", "DewPt", or "RH__%" from file names and store in column data_type
         , data_type := str_extract(file_name, "([Ss]oil|[Ll]ux|RH_[_]?%|DewP[Tt])")
-    ][ # Extract the word "test" from file names and store in column test_data
-        , test_data := str_extract(file_name, "[Tt]est")
+    ][ # Extract the word "test" from file names and store in column test
+        , test := str_extract(file_name, "[Tt]est")
     ]
 }
 
@@ -333,8 +355,8 @@ extract_plot_and_type_Mead <- function(datatable){
         
     ][ # Extract the words "soil", "lux", "DewPt", or "RH__%" from file names and store in column data_type
         , data_type := str_extract(file_name, "([Ss]oil|[Ll]ux|RH_[_]?%|DewP[Tt])")
-    ][ # Extract the word "test" from file names and store in column test_data
-        , test_data := str_extract(file_name, "[Tt]est")
+    ][ # Extract the word "test" from file names and store in column test
+        , test := str_extract(file_name, "[Tt]est")
     ]
 }
 
@@ -385,89 +407,119 @@ extract_plot_and_type_Beach <- function(datatable){
         
     ][ # Extract the words "soil", "lux", from file names and store in column data_type
         , data_type := str_extract(file_name, "([Ss]oil|[Ll]ux")
-    ][ # Extract the word "test" from file names and store in column test_data
-        , test_data := str_extract(file_name, "[Tt]est")
+    ][ # Extract the word "test" from file names and store in column test
+        , test := str_extract(file_name, "[Tt]est")
     ]
 }
 
 convert_to_celsius <- function(datatable){
     
-    # Create a list of all the files that contain data in the summer months (this should be all of them)
-    summer_files <- unique(datatable[month(fixed_date) %in% c(6,7,8), file_with_year])
-    # Create a list of any files that do not contain any summer data
-    no_summer <- unique(datatable[!file_with_year %in% summer_files, file_with_year])
-    # If any such files exist throw an error; the strategy for identifying C Vs F will need amending
-    if (length(no_summer) > 0){
-        errorCondition(paste("The following files contained no summer data and so the temperature unit",
-                             "could not be determined:", no_summer, sep = "\n"))
+    # Create list of all columns containing temperature data
+    temp_col_names <- grep("temp", names(datatable), ignore.case = TRUE, value = TRUE)
+    # For each temperature column, convert any Fahrenheit data to Celsius
+    for (name in temp_col_names){
+        # Create a list of all the files that contain data in the summer months (this should be all of them)
+        summer_files <- unique(datatable[month(fixed_date) %in% c(6,7,8) & !is.na(get(name)), file_with_year])
+        # Create a list of any files that do not contain any summer data
+        no_summer <- unique(datatable[!file_with_year %in% summer_files & !is.na(get(name)), file_with_year])
+        # If any such files exist throw an error; the strategy for identifying C Vs F will need amending
+        if (length(no_summer) > 0){
+            errorCondition(paste("The following files contained no summer data and so the temperature unit",
+                                 "could not be determined:", no_summer, sep = "\n"))
+        }
+        # Name for column to contain summer_median of the data in the named temp_col_name
+        summer_median_col <- paste0(name, "_summer_median")
+        # Name for column that will store the determined units for the data in the named temp_col_name
+        units_col <- paste0(name, "_units")
+        # Calculate the median temperature in the summer (June, July, Aug), for every file
+        datatable[!is.na(get(name)), (summer_median_col) :=
+                      median(.SD[, get(name)][month(fixed_date) %in% c(6,7,8)], na.rm = TRUE),
+                  by=file_with_year
+        ][# if the summer median is between 0 and 25, record the temperature as C
+            # If between 25 and 70 record the temperature as F, else NA
+            !is.na(get(name)) , (units_col) := ifelse(get(summer_median_col) > 0 & get(summer_median_col) < 25,
+                                                      "C",
+                                                      ifelse(get(summer_median_col) > 25 & get(summer_median_col) < 70,
+                                                             "F", NA)),
+            by= get(summer_median_col)
+        ][ # for all Fahrenheit values, convert the temperature to C
+            get(units_col) == "F" & !is.na(get(name)), (name) := round((get(name) - 32)/1.8, 3)
+        ]
     }
-    # ensure that the temperature is stored as numeric
-    datatable[, Temp := as.numeric(Temp)]
-    # Calculate the median temperature in the summer (June, July, Aug), for every file
-    datatable[, summer_median :=
-                  median(.SD$Temp[month(fixed_date) %in% c(6,7,8)], na.rm = TRUE),
-              by=file_with_year
-    ][# if the summer median is between 0 and 25, record the temperature as C
-        # If between 25 and 70 record the temperature as F, else NA
-        , units := ifelse(summer_median > 0 & summer_median < 25,
-                          "C",
-                          ifelse(summer_median > 25 & summer_median < 70,
-                                 "F", NA)),
-        by=summer_median
-    ][ # for all Fahrenheit values, convert the temperature to C
-        units == "F", Temp := round((Temp - 32)/1.8, 3)
-    ]
-    
+    # Remove all columns added to the datatable by this function
+    cols_to_remove <- grep("summer|units", names(datatable), value = TRUE)
+    datatable[, (cols_to_remove) := NULL]
+    datatable
 }
 
 clean_data <- function(datatable){
-    data_type <- datatable[1, data_type]
-    if (grepl("temp", data_type, ignore.case = TRUE)){
-        min <- -60
-        max <- 35
-    } else {
-        min <- 0
-        max <- 1000000
+    # Create list of columns containing data to be compiled
+    data_cols <- grep("data", names(datatable), value = TRUE)
+    # For every data column, set data to NA if out of bounds and remove duplicates
+    for (data_col in data_cols){
+        # Set reasonable bounds based on data type
+        if (grepl("temp", data_col, ignore.case = TRUE)){
+            min <- -60
+            max <- 35
+        } else {
+            min <- 0
+            max <- 1000000
+        }
+        # Make name for column to contain standard deviation for this data_col
+        data_col_SD <- paste0(data_col, "_SD")
+        # For all values with a shared plot and date-time, calculate the standard deviation
+        datatable[!is.na(get(data_col)), (data_col_SD) := sd(get(data_col), na.rm = TRUE), by=.(plot, fixed_date)]
+        # For all standard deviations less than one, amend the temperature to the average 
+        # of the shared results
+        datatable[data.table::between(get(data_col_SD), 0, 1, FALSE), (data_col) := mean(get(data_col)),
+                  by=.(plot, fixed_date)]
+        # If the SD is greater than one, or the temperature is not between -60 and 35 C then
+        # amend the temperature to NA
+        datatable[get(data_col_SD) >= 1 | !data.table::between(get(data_col), get("min"), get("max")) , (data_col) := NA]
     }
-    # For all values with a shared plot and date-time, calculate the standard deviation
-    datatable[, Temp_SD := sd(Temp, na.rm = TRUE), by=.(plot, fixed_date)]
-    # For all standard deviations less than one, amend the temperature to the average 
-    # of the shared results
-    datatable[data.table::between(Temp_SD, 0, 1, FALSE), Temp := mean(Temp),
-              by=.(plot, fixed_date)]
-    # If the SD is greater than one, or the temperature is not between -60 and 35 C then
-    # amend the temperature to NA
-    datatable[Temp_SD >= 1 | !data.table::between(Temp, get("min"), get("max")) , Temp := NA]
     # Remove all duplicate entries
-    unique(datatable, by=c("plot", "fixed_date"))
+    datatable <- unique(datatable, by = c("fixed_date", "plot", data_cols))
+    
+    # Remove SD columns
+    SD_cols <- grep("SD", names(datatable), value = TRUE)
+    datatable[, (SD_cols) := NULL]
     datatable
     
 }
 
-make_plots <- function(output_dir, datatable, data_type){
+make_plots <- function(output_dir, datatable){
+    # Create dir for plots if it doesn't already exist
     if (!dir.exists(output_dir)){
         dir.create(output_dir)
     }
+    # Get name of data column
+    data_col <- grep("data", names(datatable), value = TRUE)
+    # find all unique plots and files_with_year
     plots <- unique(datatable[, plot])
     files <- unique(datatable[, file_with_year])
+    # Make a plot for each file and plot and store in output_dir
     for (current_plot in plots){
         for (current_file in files){
             plot_file_data <- datatable[plot == current_plot &
                                             file_with_year == current_file &
-                                            !is.na(Temp)]
+                                            !is.na(get(data_col))]
             if (nrow(plot_file_data) > 0){
+                year_range <- paste0(plot_file_data[,min(year(fixed_date))],
+                                     "-",
+                                     plot_file_data[, max(year(fixed_date))]
+                )
                 jpeg(paste0(output_dir,
                             "/",
                             current_plot,
                             "_",
-                            unique(plot_file_data$Year)[1],
+                            year_range,
                             ".jpeg"
                 ),
                 width = 1400, height = 1400)
                 plot(plot_file_data$fixed_date,
-                     plot_file_data$Temp,
+                     plot_file_data[[data_col]],
                      xlab = "Date",
-                     ylab = data_type)
+                     ylab = data_col)
                 dev.off()
             }
         }
@@ -509,45 +561,51 @@ site_setup <- function(input_dir, site, extractor_functions){
 # A function to subset the site specific hobo data to contain only the data pertaining to
 # the sensor type selected. It returns a list containing the subset datatable and also standardises
 # the name of the data_type
-data_type_selector <- function(datatable, data_selection){
-    # Synonyms for all the sensor types
-    soil_syn <- c("soil", "Soil")
-    light_syn <- c("lux", "Lux")
-    RH_syn <- c("RH%", "RH_%", "RH__%")
-    DewPt_syn <- c("DewPt", "DewPT")
-    test_syn <- c("test", "Test")
+data_type_selector <- function(datatable){
+    # Synonyms for all the sensor types. First synonym will be name of column for this data_type and
+    # should include the word "data".
+    soil_syn <- c("soil_temp_data", "soil", "Soil")
+    light_syn <- c("lux_data", "lux", "Lux")
     
-    # If data_selection matches any known sensor type except air then subset the datatable
-    # by the data_type column containing all the associated synonyms. If "air" is requested
-    # return all data with no data_type recorded (data_type == NA). If data selection is not
-    # recognised return an error message.
-    # Soil temperature data
-    if (grepl("soil", data_selection, ignore.case = TRUE)){
-        datatable <- datatable[data_type %in% soil_syn]
-        datatable[, data_type := "soil_temp"]
-        # Light intensity   
-    } else if (grepl("lux|light", data_selection, ignore.case = TRUE)){
-        datatable <- datatable[data_type %in% light_syn]
-        datatable[, data_type := "light_lux"]
-        # Relative Humidity    
-    } else if (grepl("humidity|relative|RH", data_selection, ignore.case = TRUE)){
-        datatable <- datatable[data_type %in% RH_syn]
-        datatable[, data_type := "relative_humidity"]
-        # Dew Point    
-    } else if (grepl("dew_point|dewpt|dew_pt", data_selection, ignore.case = TRUE)){
-        datatable <- datatable[data_type %in% DewPt_syn]
-        datatable[, data_type := "dew_point"]
-        # Test data
-    } else if (grepl("test", data_selection, ignore.case = TRUE)){
-        datatable <- datatable[data_type %in% test_syn]
-        datatable[, data_type := "dew_point"]
-        # Air temperature data    
-    } else if (grepl("Air", data_selection, ignore.case = TRUE)){
-        datatable <- datatable[is.na(data_type)]
-        datatable[, data_type := "air_temp"]
-        # Error conditioning
-    } else {
-        errorCondition("Did not recognise data_selection")
+    # Create list of synonym lists
+    syn_list <- list(soil_syn, light_syn)
+    
+    # For each sensor type, create a new column with the first element of its synonym list as its
+    # name containing all data marked as having that data_type. Also, standardise the synonyms to
+    # all match the first entry in the synonym list
+    for (sensor_type in syn_list){
+        datatable[data_type %in% sensor_type, data_type := ..sensor_type[[1]]]
+        datatable[data_type %in% sensor_type, (sensor_type[[1]]) := all_data]
     }
+    # Create a column containing the file_name appended with the year of collection to allow
+    # differentiation between files with the same name between years
+    datatable[, year_file := paste0(Year, file_name)]
+    # get list of filenames associated with light sensors
+    light_files <- datatable[data_type == light_syn[[1]], unique(year_file)]
+    
+    # remove everything past the first dot from the file names. Everything past the first dot
+    # should be the column name that was appended to the original file name. That original file name
+    # should be shared with temperature data that was recorded by the same device. This temp data
+    # needs segregating, as it was recorded while exposed to direct sunlight, which is not normally
+    # the case.
+    
+    light_files <- gsub("\\..*", "", light_files)
+    
+    # Remove the column name from the file_name within year_file so that they can be easily compared
+    # with the contents of  light_files
+    datatable[, year_file := gsub("\\..*", "", year_file)]
+    
+    # mark out all air temperature data from the same file as light data as sun exposed
+    datatable[is.na(data_type) & year_file %in% light_files, data_type := "Air_temp_sun_data"]
+    
+    # Create column with sun exposed data in it
+    datatable[data_type == "Air_temp_sun_data", Air_temp_sun_data := all_data]
+    
+    # Create column for the rest of the air temp data
+    datatable[is.na(data_type), Air_temp_data := all_data]
+    
+    # remove columns all_data, data_type, and year_file from datatable
+    datatable[, c("all_data", "data_type", "year_file") := NULL]
+    
     datatable
 }
