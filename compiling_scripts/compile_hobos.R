@@ -1,6 +1,7 @@
 library(data.table)
 library(stringr)
 library(lubridate)
+library(tundra)
 
 output_dir <- "/home/ross/Desktop/compiled_hobo/"
 input_dir <- "/media/ross/BackupPlus/Hoba_data/"
@@ -21,6 +22,8 @@ compile_hobo_data <- function(output_dir, input_dir, site){
     file_path <- site_specific[[1]]
     # The standardised name for the site
     site_name <- site_specific[[2]]
+    # add the site name to the output directory path
+    output_dir <- paste0(output_dir, "/", site_name)
     # The site specific function which extracts the plot name and sensor type from the 
     # file names of the original data (stored in column two of the lump files)
     extract_plot_and_type <- site_specific[[3]]
@@ -87,23 +90,6 @@ compile_hobo_data <- function(output_dir, input_dir, site){
         fixed_date := NA
     ]
     
-    # to provide a method of checking that the dates were read correctly, the time difference in
-    # seconds was calculated between a given entry and the following row. This is stored in the
-    # column date_diff. To calculate this, the date of the next row is stored in next_date. To allow
-    # easy comparison, the time difference from the previous row is stored in column prev_diff
-    site_data[# Offset the dates in fixed_date to create the next_date column. Group by file and plot
-        # to prevent transitioning between plot or file resulting in large time differences
-        , next_date := c(.SD$fixed_date[2:length(.SD$fixed_date)], NA), by = .(file_name, plot)
-    ][ # convert the date back into date format. Data.table likes to return the time in seconds
-        # from 1970
-        , next_date := as_datetime(next_date)
-    ][ # Calculate time difference between next and current date-time
-        , date_diff := next_date - fixed_date
-    ][ # Offset the differences to produce a column of time differences from one row previous
-        , prev_diff := c(NA, .SD$date_diff[1:(length(.SD$date_diff) - 1)]),
-        by = .(file_name, plot)
-    ]
-    
     # The data is in a mixture of Celsius and Fahrenheit. Convert all Fahrenheit to Celsius 
     convert_to_celsius(site_data)
     
@@ -111,6 +97,12 @@ compile_hobo_data <- function(output_dir, input_dir, site){
     # Standard deviation is less than one. Otherwise, or if the values are outwith -60 - 35 oC, then they are
     # replaced with NA
     site_data <- clean_data(site_data)
+    # Two different types of hobo have been used. When the "big" hobos were replaced they were ran
+    # concurrently with the "small" hobos for a time. The data collected by the "big" hobos was identified
+    # in the file name with "big". This function looks, per plot, at the first time a data point comes from
+    # a file called big. Everything before this time is assumed to be a big hobo, and everything after is 
+    # assumed to be small if it isn't labeled big
+    identify_big_hobos(site_data)
     # Get list of data columns
     data_cols <- grep("data", names(site_data), value = TRUE)
     # For every data column create a csv file containing that data and plot information, and also produce plots
@@ -138,17 +130,32 @@ compile_hobo_data <- function(output_dir, input_dir, site){
                              specific_data.table[, max(year(fixed_date))]
         )
         data_col_name <- sub("_data", "", data_col)
+        # Add site column, remove file with year, and rename "fixed_date" to "date'
         specific_data.table[, c("site", "date", "file_with_year") := .(get("site_name"),
                                                                        fixed_date,
                                                                        NULL
         )]
         # re-order the columns
         specific_data.table <- specific_data.table[, .(site, date, plot, get(data_col), file_name)]
+        # Give the data column its appropriate name
         names(specific_data.table)[4] <- data_col_name
         
+        # convert to a dataframe so that the standardise_plots function can be applied, providing a
+        # standardised format for plot information and a unique plot ID for each entry
         setDF(specific_data.table)
         specific_data.table <- tundra::standardise_plots(specific_data.table, output_dir, data_col)
-        
+        # Rearange column order for final writing of file
+        specific_data.table <- dplyr::select(specific_data.table, site,
+                                             plot_id,
+                                             date,
+                                             plot,
+                                             otc_treatment,
+                                             snow_treatment,
+                                             co2_plot,
+                                             .data[[data_col_name]],
+                                             file_name)
+        specific_data.table <- dplyr::arrange(specific_data.table, date, plot)
+        # Create CSV file containing specific data type
         write.csv(specific_data.table, paste0(output_dir,
                                               "/",
                                               data_col,
@@ -166,6 +173,27 @@ compile_hobo_data <- function(output_dir, input_dir, site){
     site_data
 }
 
+# Two different types of hobo have been used. When the "big" hobos were replaced they were ran
+# concurrently with the "small" hobos for a time. The data collected by the "big" hobos was identified
+# in the file name with "big". This function looks, per plot, at the first time a data point comes from
+# a file called big. Everything before this time is assumed to be a big hobo, and everything after is 
+# assumed to be small if it isn't labeled big
+identify_big_hobos <- function(datatable){
+    # Identify the first time every plot had a file called big
+    datatable[grepl("big", file_name, ignore.case = TRUE), start_small := min(fixed_date), by=plot]
+    # Copy the start_new data to every datapoint in the datatable (by plot), as it currently only
+    # exists for the subset of datapoints belonging to file_names containing "big"
+    datatable[, start_new := unique(.SD$start_small[!is.na(.SD$start_small)]), by=plot]
+    # For all data points where the file is not labeled as being a "big" hobo, assume big hobo if the
+    # date is before the installation date for small hobos. Else, or if there is no installation date,
+    # assume big_hobo == FALSE
+    datatable[!grepl("big", file_name, ignore.case = TRUE), 
+              big_hobo := ifelse(is.na(start_small), FALSE, ifelse(fixed_date < start_small, TRUE, FALSE))]
+    # Set big_hobo to TRUE for all data labeled with big
+    datatable[grepl("big", file_name, ignore.case = TRUE), old_hobo := TRUE]
+    datatable
+}
+
 extract_plot_and_type_Cas <- function(datatable){
     
     datatable[# Remove needless counting number at end of file_name
@@ -179,11 +207,11 @@ extract_plot_and_type_Cas <- function(datatable){
     ][ # Remove any hyphens from the extracted plot names
         , plot := sub("-", "", plot)
     ][ # Change the order of the plot name to Letter-Number if not already
-        , plot := sub("(\\d+)(\\w+)", "\\2\\1", plot)
+        , plot := sub("([0-9]+)([A-z]+)", "\\2\\1", plot)
     ][ # Remove all "b"s from the plot names
         , plot := sub("b", "", plot)
     ][ # Remove all starting 0's from plot names eg T03 becomes T3
-        , plot := sub("(\\w)0(\\d)", "\\1\\2", plot)
+        , plot := sub("([A-z])0([0-9])", "\\1\\2", plot)
     ][ # Convert all letters to upper case
         , plot := toupper(plot)
     ][ # Extract the words "soil", "lux", or "_F_" from file names and store in column data_type
@@ -226,7 +254,7 @@ extract_plot_and_type_Dry <- function(datatable){
         , plot := sub("-", "", plot)
     ][ # Change the order of the plot name to Letter-Number, if not already. 
         # The look ahead (?>!) serves to prevent this line from running if it starts with a letter.
-        , plot := sub("(?<![A-z])(\\d+)(\\w+)", "\\2\\1", plot, perl = TRUE)
+        , plot := sub("(?<![A-z])([0-9]+)([A-z]+)", "\\2\\1", plot, perl = TRUE)
     ][ # Convert all letters to upper case
         , plot := toupper(plot)
     ][ # Standardize treatment codes to C for control and T for treatment (i.e. OTC, W).
@@ -278,7 +306,7 @@ extract_plot_and_type_Wil <- function(datatable){
         , plot := sub("-", "", plot)
     ][ # Change the order of the plot name to Letter-Number, if not already. 
         # The look behind (?<!) serves to prevent this line from running if it starts with a letter.
-        , plot := sub("(?<![A-z])(\\d+)(\\w+)", "\\2\\1", plot, perl = TRUE)
+        , plot := sub("(?<![A-z])([0-9]+)([A-z]+)", "\\2\\1", plot, perl = TRUE)
     ][ # Convert all letters to upper case
         , plot := toupper(plot)
     ][ # Standardize treatment codes to C for control and T for treatment (i.e. OTC, W).
@@ -566,16 +594,21 @@ data_type_selector <- function(datatable){
     # should include the word "data".
     soil_syn <- c("soil_temp_data", "soil", "Soil")
     light_syn <- c("lux_data", "lux", "Lux")
+    dew_syn <- c("dew_point", "DewPt")
+    humidity_syn <- c("humidity", "RH__%")
     
     # Create list of synonym lists
-    syn_list <- list(soil_syn, light_syn)
+    syn_list <- list(soil_syn, light_syn, dew_syn, humidity_syn)
     
     # For each sensor type, create a new column with the first element of its synonym list as its
     # name containing all data marked as having that data_type. Also, standardise the synonyms to
     # all match the first entry in the synonym list
     for (sensor_type in syn_list){
-        datatable[data_type %in% sensor_type, data_type := ..sensor_type[[1]]]
-        datatable[data_type %in% sensor_type, (sensor_type[[1]]) := all_data]
+        # Create new data column if data type is present
+        if (sum(sensor_type %in% datatable$data_type) > 0){
+            datatable[data_type %in% sensor_type, data_type := ..sensor_type[[1]]]
+            datatable[data_type %in% sensor_type, (sensor_type[[1]]) := all_data]
+        }
     }
     # Create a column containing the file_name appended with the year of collection to allow
     # differentiation between files with the same name between years
@@ -583,26 +616,30 @@ data_type_selector <- function(datatable){
     # get list of filenames associated with light sensors
     light_files <- datatable[data_type == light_syn[[1]], unique(year_file)]
     
-    # remove everything past the first dot from the file names. Everything past the first dot
-    # should be the column name that was appended to the original file name. That original file name
-    # should be shared with temperature data that was recorded by the same device. This temp data
-    # needs segregating, as it was recorded while exposed to direct sunlight, which is not normally
-    # the case.
-    
-    light_files <- gsub("\\..*", "", light_files)
-    
-    # Remove the column name from the file_name within year_file so that they can be easily compared
-    # with the contents of  light_files
-    datatable[, year_file := gsub("\\..*", "", year_file)]
-    
-    # mark out all air temperature data from the same file as light data as sun exposed
-    datatable[is.na(data_type) & year_file %in% light_files, data_type := "Air_temp_sun_data"]
-    
-    # Create column with sun exposed data in it
-    datatable[data_type == "Air_temp_sun_data", Air_temp_sun_data := all_data]
+    # If light files are present, give any air temperature data from the same file the column name
+    # air_temp_sun_data
+    if (length(light_files) > 0){
+        # remove everything past the first dot from the file names. Everything past the first dot
+        # should be the column name that was appended to the original file name. That original file name
+        # should be shared with temperature data that was recorded by the same device. This temp data
+        # needs segregating, as it was recorded while exposed to direct sunlight, which is not normally
+        # the case.
+        
+        light_files <- gsub("\\..*", "", light_files)
+        
+        # Remove the column name from the file_name within year_file so that they can be easily compared
+        # with the contents of  light_files
+        datatable[, year_file := gsub("\\..*", "", year_file)]
+        
+        # mark out all air temperature data from the same file as light data as sun exposed
+        datatable[is.na(data_type) & year_file %in% light_files, data_type := "Air_temp_sun_data"]
+        
+        # Create column with sun exposed data in it
+        datatable[data_type == "Air_temp_sun_data", air_temp_sun_data := all_data]
+    }
     
     # Create column for the rest of the air temp data
-    datatable[is.na(data_type), Air_temp_data := all_data]
+    datatable[is.na(data_type), air_temp_data := all_data]
     
     # remove columns all_data, data_type, and year_file from datatable
     datatable[, c("all_data", "data_type", "year_file") := NULL]
