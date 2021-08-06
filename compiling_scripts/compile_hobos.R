@@ -103,6 +103,8 @@ compile_hobo_data <- function(output_dir, input_dir, site){
     # a file called big. Everything before this time is assumed to be a big hobo, and everything after is 
     # assumed to be small if it isn't labeled big
     identify_big_hobos(site_data)
+    
+    site_data[, hobo_id := hobo_id_extractor(file_name, unique = FALSE)]
     # Get list of data columns
     data_cols <- grep("data", names(site_data), value = TRUE)
     # For every data column create a csv file containing that data and plot information, and also produce plots
@@ -114,10 +116,16 @@ compile_hobo_data <- function(output_dir, input_dir, site){
         }
         # create a column in site_data detailing which file_years are associated with non-NA data in data_col
         site_data[, contains_col_data := sum(is.na(.SD)) < nrow(.SD), by=file_with_year, .SDcol = data_col]
-        
+
         # Create a new datatable containing only the data relevant to data_col
         specific_data.table <- copy(site_data[contains_col_data == TRUE & is.na(test),
-                                              .(plot, fixed_date, get(data_col), file_name, file_with_year)])
+                                              .(plot, 
+                                                fixed_date,
+                                                get(data_col),
+                                                file_name,
+                                                file_with_year,
+                                                hobo_id)
+                                              ])
         
         # For some reason the name of the data_col is lost and refuses to be re-appointed using dt[, (data_col) := V3]
         names(specific_data.table)[3] <- data_col
@@ -136,7 +144,7 @@ compile_hobo_data <- function(output_dir, input_dir, site){
                                                                        NULL
         )]
         # re-order the columns
-        specific_data.table <- specific_data.table[, .(site, date, plot, get(data_col), file_name)]
+        specific_data.table <- specific_data.table[, .(site, date, plot, get(data_col), file_name, hobo_id)]
         # Give the data column its appropriate name
         names(specific_data.table)[4] <- data_col_name
         
@@ -153,7 +161,8 @@ compile_hobo_data <- function(output_dir, input_dir, site){
                                              snow_treatment,
                                              co2_plot,
                                              .data[[data_col_name]],
-                                             file_name)
+                                             file_name,
+                                             hobo_id)
         specific_data.table <- dplyr::arrange(specific_data.table, date, plot)
         # Create CSV file containing specific data type
         write.csv(specific_data.table, paste0(output_dir,
@@ -434,7 +443,7 @@ extract_plot_and_type_Beach <- function(datatable){
         , plot := sub("([A-Z][0-9]{1,2}).*", "\\1", plot)
         
     ][ # Extract the words "soil", "lux", from file names and store in column data_type
-        , data_type := str_extract(file_name, "([Ss]oil|[Ll]ux")
+        , data_type := str_extract(file_name, "([Ss]oil|[Ll]ux)")
     ][ # Extract the word "test" from file names and store in column test
         , test := str_extract(file_name, "[Tt]est")
     ]
