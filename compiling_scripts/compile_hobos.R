@@ -3,7 +3,7 @@ library(stringr)
 library(lubridate)
 library(tundra)
 
-output_dir <- "/home/ross/Desktop/compiled_hobo/"
+output_dir <- "/home/ross/Desktop/new_compiled_hobo/"
 input_dir <- "/media/ross/BackupPlus/Hoba_data/"
 
 compile_hobo_data <- function(output_dir, input_dir, site){
@@ -70,43 +70,27 @@ compile_hobo_data <- function(output_dir, input_dir, site){
     # extracted from the file path of the original data and represents the year the data was
     # saved. The date is considered correct if it has a year equal to the year of saving, or no
     # more than two years less.
-    site_data[ # Create a new date column and fill it with the output of reading the
-        # original dates in year/month/day format
-        , fixed_date := ymd_hms(Date_Time)
-    ][ # If ymd_hms returned a date with a year not equal to the year of saving, or no
-        # more than two less, then change these dates to NA
-        !is.na(fixed_date) &
-            (Year < year(fixed_date) |
-                 Year - 2 > year(fixed_date)),
-        fixed_date := NA
-    ][ # For any row that still has NA in fixed_date, attempt to read the original date in
-        # month/day/year format
-        is.na(fixed_date), fixed_date := mdy_hms(Date_Time)
-    ][# Again, any dates with a year not equal or no more than two less than the year of
-        # saving is changed to NA
-        !is.na(fixed_date) &
-            (Year < year(fixed_date) |
-                 Year - 2 > year(fixed_date)),
-        fixed_date := NA
-    ]
+    # Some of the date data (for example for the Dryas site) has somehow gained a ".0" at the end.
+    # This needs to be removed
+    site_data <- fix_dates(site_data, output_dir)
+
     
     # The data is in a mixture of Celsius and Fahrenheit. Convert all Fahrenheit to Celsius 
     convert_to_celsius(site_data)
     
+    # A unique identifier for the hobo device is often included in the file_name or within the files themselves.
+    # Extract this number and include in the datatable
+    site_data <- find_hobo_id(site_data, site = site_name, input_dir)
+    
     # If multiple entries have somehow been recorded for the same plot and time then they are averaged if the
     # Standard deviation is less than one. Otherwise, or if the values are outwith -60 - 35 oC, then they are
     # replaced with NA
-    site_data <- clean_data(site_data)
-    # Two different types of hobo have been used. When the "big" hobos were replaced they were ran
-    # concurrently with the "small" hobos for a time. The data collected by the "big" hobos was identified
-    # in the file name with "big". This function looks, per plot, at the first time a data point comes from
-    # a file called big. Everything before this time is assumed to be a big hobo, and everything after is 
-    # assumed to be small if it isn't labeled big
-    identify_big_hobos(site_data)
+    site_data <- clean_data(site_data, output_dir)
     
-    site_data[, hobo_id := hobo_id_extractor(file_name, unique = FALSE)]
+    
+    
     # Get list of data columns
-    data_cols <- grep("data", names(site_data), value = TRUE)
+    data_cols <- grep("data$", names(site_data), value = TRUE)
     # For every data column create a csv file containing that data and plot information, and also produce plots
     # for each file_year
     for (data_col in data_cols){
@@ -116,16 +100,16 @@ compile_hobo_data <- function(output_dir, input_dir, site){
         }
         # create a column in site_data detailing which file_years are associated with non-NA data in data_col
         site_data[, contains_col_data := sum(is.na(.SD)) < nrow(.SD), by=file_with_year, .SDcol = data_col]
-
+        
         # Create a new datatable containing only the data relevant to data_col
         specific_data.table <- copy(site_data[contains_col_data == TRUE & is.na(test),
-                                              .(plot, 
+                                              .(plot,
                                                 fixed_date,
                                                 get(data_col),
                                                 file_name,
                                                 file_with_year,
                                                 hobo_id)
-                                              ])
+        ])
         
         # For some reason the name of the data_col is lost and refuses to be re-appointed using dt[, (data_col) := V3]
         names(specific_data.table)[3] <- data_col
@@ -489,34 +473,64 @@ convert_to_celsius <- function(datatable){
     datatable
 }
 
-clean_data <- function(datatable){
+clean_data <- function(datatable, output_dir){
+    # create datatables for excluded data and averaged data
+    excluded_data <- data.table()
+    averaged_data <- data.table()
     # Create list of columns containing data to be compiled
-    data_cols <- grep("data", names(datatable), value = TRUE)
+    data_cols <- grep("data$", names(datatable), value = TRUE)
     # For every data column, set data to NA if out of bounds and remove duplicates
     for (data_col in data_cols){
         # Set reasonable bounds based on data type
         if (grepl("temp", data_col, ignore.case = TRUE)){
             min <- -60
-            max <- 35
+            max <- 40
         } else {
-            min <- 0
+            min <- -100000
             max <- 1000000
         }
         # Make name for column to contain standard deviation for this data_col
         data_col_SD <- paste0(data_col, "_SD")
         # For all values with a shared plot and date-time, calculate the standard deviation
-        datatable[!is.na(get(data_col)), (data_col_SD) := sd(get(data_col), na.rm = TRUE), by=.(plot, fixed_date)]
-        # For all standard deviations less than one, amend the temperature to the average 
+        datatable[!is.na(get(data_col)), (data_col_SD) := sd(get(data_col), na.rm = TRUE), by=.(plot, fixed_date, hobo_id)]
+        # For all standard deviations less than 0.2, amend the temperature to the average 
         # of the shared results
-        datatable[data.table::between(get(data_col_SD), 0, 1, FALSE), (data_col) := mean(get(data_col)),
-                  by=.(plot, fixed_date)]
-        # If the SD is greater than one, or the temperature is not between -60 and 35 C then
+        # If data is to be averaged, write it to disk first for manual checking
+        if (nrow(datatable[data.table::between(get(data_col_SD), 0, 0.2, FALSE)]) > 0){
+            averaged_data <- rbindlist(
+                list(averaged_data, 
+                     datatable[data.table::between(get(data_col_SD), 0, 0.2, FALSE)]),
+                fill = TRUE)
+        }
+        datatable[data.table::between(get(data_col_SD), 0, 0.2, FALSE), (data_col) := mean(get(data_col)),
+                  by=.(plot, fixed_date, hobo_id)]
+        # If the SD is greater than 0.2, or the temperature is not between -60 and 35 C then
         # amend the temperature to NA
+        # If data is to be excluded, write it to disk first for manual checking
+        if (nrow(datatable[get(data_col_SD) >= 1 | !data.table::between(get(data_col), get("min"), get("max"))]) > 0){
+            excluded_data <- rbindlist(
+                list(excluded_data, 
+                     datatable[get(data_col_SD) >= 1 | !data.table::between(get(data_col), get("min"), get("max"))]),
+                fill = TRUE)
+        }
         datatable[get(data_col_SD) >= 1 | !data.table::between(get(data_col), get("min"), get("max")) , (data_col) := NA]
     }
     # Remove all duplicate entries
-    datatable <- unique(datatable, by = c("fixed_date", "plot", data_cols))
+    datatable <- unique(datatable, by = c("fixed_date", "plot", data_cols, "hobo_id"))
     
+    # If data averaged or excluded write this data to disk for checking
+    if (nrow(averaged_data) > 0){
+        if (!dir.exists(output_dir)){
+            dir.create(output_dir, recursive = TRUE)
+        }
+        fwrite(averaged_data, paste0(output_dir, "/averaged_data.csv"))
+    }
+    if (nrow(excluded_data) > 0){
+        if (!dir.exists(output_dir)){
+            dir.create(output_dir, recursive = TRUE)
+        }
+        fwrite(excluded_data, paste0(output_dir, "/excluded_data.csv"))
+    }
     # Remove SD columns
     SD_cols <- grep("SD", names(datatable), value = TRUE)
     datatable[, (SD_cols) := NULL]
@@ -525,6 +539,8 @@ clean_data <- function(datatable){
 }
 
 make_plots <- function(output_dir, datatable){
+    # Add /plots to the output_dir
+    output_dir <- paste0(output_dir, "/plots")
     # Create dir for plots if it doesn't already exist
     if (!dir.exists(output_dir)){
         dir.create(output_dir)
@@ -603,8 +619,8 @@ data_type_selector <- function(datatable){
     # should include the word "data".
     soil_syn <- c("soil_temp_data", "soil", "Soil")
     light_syn <- c("lux_data", "lux", "Lux")
-    dew_syn <- c("dew_point", "DewPt")
-    humidity_syn <- c("humidity", "RH__%")
+    dew_syn <- c("dew_point_data", "dew_point", "DewPt")
+    humidity_syn <- c("relative_humidity_data", "humidity", "RH__%")
     
     # Create list of synonym lists
     syn_list <- list(soil_syn, light_syn, dew_syn, humidity_syn)
@@ -650,8 +666,161 @@ data_type_selector <- function(datatable){
     # Create column for the rest of the air temp data
     datatable[is.na(data_type), air_temp_data := all_data]
     
-    # remove columns all_data, data_type, and year_file from datatable
-    datatable[, c("all_data", "data_type", "year_file") := NULL]
+    # remove columns all_data, and year_file from datatable
+    datatable[, c("all_data", "year_file") := NULL]
     
+    datatable
+}
+find_hobo_id <- function(datatable, site, input_dir){
+    root_dir <- paste0(input_dir, "/Hobos2/Hobos/", site, "/")
+    # some file names have aquired spaces and inverted commas that should not be there. Remove them
+    datatable[, file_name := gsub("[\" ]", "", file_name)]
+    # Create a full file_path for each entry
+    datatable[, file_path := paste0(..root_dir, "/", Year, "/", file_name, ".csv")]
+    # Check that each file actually exists. Some file names had .csv written multiple times
+    # within them and they were subsequently removed. If file does not exist, attempt to add
+    # the .csv back into the path
+    datatable[!file.exists(file_path), file_path := sub("\\.Temp", ".csvTemp", file_path), by = .(file_path)]
+    datatable[!file.exists(file_path), file_path := sub("\\.Intensity", ".csvIntensity", file_path), by = .(file_path)]
+    datatable[!file.exists(file_path), file_path := sub("\\.RH__%", ".csvRH__%", file_path), by = .(file_path)]
+    datatable[!file.exists(file_path), file_path := sub("\\.DewPt", ".csvDewPt", file_path), by = .(file_path)]
+    datatable[!file.exists(file_path), file_path := sub("\\.\\.csv", ".csv", file_path), by = .(file_path)]
+    # update all file_names to the corrected names
+    datatable[file.exists(file_path), file_name := sub(".*/([^/]*$)", "\\1", file_path)]
+    # Check that all file paths now point to real files, otherwise return non-existent paths
+    no_file <- vector("character")
+    file_paths <- unique(datatable$file_path)
+    for (file_path in file_paths){
+        if (!file.exists(file_path)){
+            no_file <- append(no_file, file_path)
+        }
+    }
+    if (length(no_file) > 0){
+        stop(paste("The following files do not exist (probably missing .csv before the column header)", no_file, sep = "\n"))
+    }
+    
+    datatable[, hobo_id := NULL][, hobo_id := vector("character")][
+        , hobo_id := hobo_id_extractor(unique(file_name), unique = FALSE), by = .(file_path)]
+    datatable[is.na(hobo_id), hobo_id := hobo_id_extractor(
+        readLines(file_path, n = 1), unique = FALSE), by = .(file_path)]
+    datatable
+}
+
+fix_dates <- function(datatable, output_dir, site_name){
+    # some file names have aquired spaces and inverted commas that should not be there. Remove them
+    datatable[, file_with_year := gsub("\\. \"\"", "", file_with_year)]
+    datatable[, Date_Time := 
+                  sub("([0-9]{2}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})\\.0", "\\1", Date_Time)]
+    
+    # Create columns with the date interpreted as year/month/day and as month/day/year
+    datatable[, date_ymd := ymd_hms(Date_Time)]
+    datatable[, date_mdy := mdy_hms(Date_Time)]
+    # Determine the day and month as predicted by ymd and mdy format
+    datatable[, day_ymd := day(date_ymd)]
+    datatable[, month_ymd := month(date_ymd)]
+    datatable[, year_ymd := year(date_ymd)]
+    datatable[, day_mdy := day(date_mdy)]
+    datatable[, month_mdy := month(date_mdy)]
+    datatable[, year_mdy := year(date_mdy)]
+    # Per plot, file, and data_type calculate by how many days and months the days and months
+    # increase by going to the next time stamp in ymd and dmy formats
+    datatable[, c("day_diff_ymd",
+                  "month_diff_ymd",
+                  "day_diff_mdy",
+                  "month_diff_mdy",
+                  "year_diff_ymd",
+                  "year_diff_mdy") := list(
+        c(.SD[2:.N]$day_ymd - .SD[1:(.N - 1)]$day_ymd, NA),
+        c(.SD[2:.N]$month_ymd - .SD[1:(.N - 1)]$month_ymd, NA),
+        c(.SD[2:.N]$day_mdy - .SD[1:(.N - 1)]$day_mdy, NA),
+        c(.SD[2:.N]$month_mdy - .SD[1:(.N - 1)]$month_mdy, NA),
+        c(.SD[2:.N]$year_ymd - .SD[1:(.N - 1)]$year_ymd, NA),
+        c(.SD[2:.N]$year_mdy - .SD[1:(.N - 1)]$year_mdy, NA)),
+        by = .(file_with_year, data_type, plot)]
+    
+  
+    # # If the date format is correct then the month should never be iterated while the day stays
+    # the same. If an example within a file contains a change in month while the day stays the same
+    # for either format then set that format to FALSE.Hopefully no file contains a mixture of 
+    # different date formats... 
+    datatable[!is.na(year(date_mdy)), row_not_mdy := 
+                  (month_diff_mdy %in% c(1, -11) & day_diff_mdy == 0) | (year_diff_mdy == 1 & day_diff_mdy == 0), 
+              by = .(file_with_year, data_type, plot)]
+    datatable[!is.na(year(date_ymd)), row_not_ymd := 
+                  (month_diff_ymd %in% c(1, -11) & day_diff_ymd == 0) | (year_diff_ymd == 1 & day_diff_ymd == 0), 
+              by = .(file_with_year, data_type, plot)]
+    
+    # If a file contains only
+    # ymd or mdy then set date_format appropriately. If it contains both set it to "mixed" and if neither
+    # format results in a change in month set it to short. If only one format results in a date then set
+    # to that format, and if neither then set to NA.
+    datatable[is.na(date_ymd) & !is.na(date_mdy), date_format := "mdy"]
+    datatable[!is.na(date_ymd) & is.na(date_mdy), date_format := "ymd"]
+    datatable[is.na(date_format), file_not_mdy := sum(.SD$row_not_mdy, na.rm = TRUE) > 0, 
+              by = .(file_with_year, data_type, plot)]
+    datatable[is.na(date_format), file_not_ymd := sum(.SD$row_not_ymd, na.rm = TRUE) > 0, 
+              by = .(file_with_year, data_type, plot)]
+    datatable[is.na(date_format) & !file_not_ymd & file_not_mdy, file_format := "ymd"]
+    datatable[is.na(date_format) & file_not_ymd & !file_not_mdy, file_format := "mdy"]
+    datatable[is.na(date_format) & file_not_ymd & file_not_mdy, file_format := "mixed"]
+    datatable[is.na(date_format) & !file_not_ymd & !file_not_mdy, file_format := "short"]
+    
+    # If the file has a mix of formats then return an error with a list of the erroneous files
+    mixed_files <- datatable[file_format == "mixed"]$file_with_year
+    if (length(mixed_files) > 0){
+        stop(paste("files with mixed date formats: ", mixed_files, sep = "\n"))
+    }
+    # if date_format is ymd or mdy then set fixed_date accordingly
+    datatable[file_format == "ymd" | date_format == "ymd", fixed_date := date_ymd]
+    datatable[file_format == "mdy" | date_format == "mdy", fixed_date := date_mdy]
+    
+    # If somehow there was not enough data to cross between months then try to distinguish between 
+    # formats by comparing the dates against the year the data was collated
+    if (nrow(datatable[file_format == "short"]) > 0){
+        datatable[file_format == "short", # set fixed date to the ymd format
+                  fixed_date := ymd_hms(Date_Time)
+        ][ # If ymd_hms returned a date with a year not equal to the year of saving, or no
+            # more than two less, then change these dates to NA
+            file_format == "short" & !is.na(fixed_date) &
+                (Year < year(fixed_date) |
+                     Year - 2 > year(fixed_date)),
+            fixed_date := NA
+        ][ # For any row that still has NA in fixed_date, attempt to read the original date in
+            # month/day/year format
+            file_format == "short" & is.na(fixed_date), fixed_date := mdy_hms(Date_Time)
+        ][# Again, any dates with a year not equal or no more than two less than the year of
+            # saving is changed to NA
+            file_format == "short" & !is.na(fixed_date) &
+                (Year < year(fixed_date) |
+                     Year - 2 > year(fixed_date)),
+            fixed_date := NA
+        ][# If no date has still been found then try both systems again but allowing the year to
+            # be two greater than the supposed year of collection. There are some occasions when
+            # this year is not correct
+            file_format == "short" & is.na(fixed_date), fixed_date := ymd_hms(Date_Time)
+            
+        ][
+            file_format == "short" & !is.na(fixed_date) &
+                (Year + 2 < year(fixed_date) |
+                     Year - 2 > year(fixed_date)),
+            fixed_date := NA
+        ][ # For any row that still has NA in fixed_date, attempt to read the original date in
+            # month/day/year format
+            file_format == "short" & is.na(fixed_date), fixed_date := mdy_hms(Date_Time)
+        ][# Again, any dates with a year not equal or no more than two less than the year of
+            # saving is changed to NA
+            file_format == "short" & !is.na(fixed_date) &
+                (Year + 2 < year(fixed_date) |
+                     Year - 2 > year(fixed_date)),
+            fixed_date := NA
+        ]
+    }
+    # If any dates can not be resolved, write to disk for manual checking
+    if (nrow(datatable[is.na(fixed_date)]) > 0){
+        if (!dir.exists(output_dir)){
+            dir.create(output_dir, recursive = TRUE)
+        }
+        fwrite(datatable[is.na(fixed_date)], paste0(output_dir, "/no_date.csv"))
+    }
     datatable
 }
