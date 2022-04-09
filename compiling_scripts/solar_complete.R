@@ -20,6 +20,13 @@ library(tundra)
 #' Solar
 #' file - The file_path to the original data
 #' 
+#' Files are found using the file_finder.sh bash script. Each site can be searched for using
+#' the following regex:
+#' Cassiope: cass(?!andra)
+#' Claude: clau|tower
+#' meadow: mead
+#' Fosheim: fosh
+#' Marie_bay: (?<!sum)(marie|bay)
 #' @param file_path A file path to a CSV or tab deliminated file that is to be searched for
 #' solar radiation data
 #' @param output_dir The directory to which all output shall be written
